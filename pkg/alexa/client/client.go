@@ -10,8 +10,8 @@ import (
 )
 
 const (
-	headerUserAgent      = "Mozilla/5.0 (Linux; Android 13; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/112.0.5615.136 Mobile Safari/537.36"
-	headerUserAgentApp   = "PitanguiBridge/2.2.527420.0-[PLATFORM=Android][MANUFACTURER=samsung][RELEASE=13][BRAND=samsung][SDK=33][MODEL=S2]"
+	headerUserAgent    = "Mozilla/5.0 (Linux; Android 13; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/112.0.5615.136 Mobile Safari/537.36"
+	headerUserAgentApp = "PitanguiBridge/2.2.527420.0-[PLATFORM=Android][MANUFACTURER=samsung][RELEASE=13][BRAND=samsung][SDK=33][MODEL=S2]"
 	headerAcceptLanguage = "en-US"
 )
 
@@ -62,53 +62,60 @@ func (c *AlexaClient) LogIn(relog bool) (err error) {
 			c.client.ResetCookieJar()
 		}
 		if c.user == "" || c.password == "" {
-			return errors.New("Alexa.LogIn no saved cookies, user and password are required but empty")
+			return errors.New("Alexa.LogIn: no saved cookies, user and password are required but empty")
 		}
 
-		// step 0: get login form
-		pageHtmlFromStep0, referer, err := getLoginForm(c.baseDomain, c.client)
+		// Step 0: Get the initial login page (which asks for email)
+		pageHtmlStep0, referer, err := getLoginForm(c.baseDomain, c.client)
 		if err != nil {
-			return errors.Wrap(err, "Alexa.LogIn getting form failed")
+			return errors.Wrap(err, "Alexa.LogIn: failed to get initial login page")
 		}
 
-		// step 1: submit login form with email w/o password
-		formHtmlFromStep0 := c.cookieHelper.ExtractLoginForm(pageHtmlFromStep0)
-		formDataForStep1 := c.cookieHelper.ExtractLoginFormInputs(formHtmlFromStep0)
-		formDataForStep1.Add("email", c.user)
-		formDataForStep1.Add("password", "")
-		pageHtmlFromStep1, err := submitLoginForm(c.baseDomain, referer, formDataForStep1, c.client)
+		// Step 1: Submit email address. Amazon should respond with a page asking for the password.
+		formHtmlStep0 := c.cookieHelper.ExtractLoginForm(pageHtmlStep0)
+		formDataStep1 := c.cookieHelper.ExtractLoginFormInputs(formHtmlStep0)
+		formDataStep1.Set("email", c.user)
+
+		pageHtmlStep1, err := submitEmailForm(c.baseDomain, referer, formDataStep1, c.client)
 		if err != nil {
-			return errors.Wrap(err, "Alexa.LogIn submit step 1 login form failed")
+			return errors.Wrap(err, "Alexa.LogIn: failed to submit email form")
 		}
 
-		// step 2: submit login form with (hidden input in real form) email and password
-		formHtmlFromStep1 := c.cookieHelper.ExtractLoginForm(pageHtmlFromStep1)
-		formDataForStep2 := c.cookieHelper.ExtractLoginFormInputs(formHtmlFromStep1)
-		formDataForStep2.Add("email", c.user)
-		formDataForStep2.Add("password", c.password)
-		_, err = submitLoginFormFinal(c.baseDomain, referer, formDataForStep2, c.client)
+		// Step 2: Extract the new form (for the password) and submit it with the password.
+		formHtmlStep1 := c.cookieHelper.ExtractLoginForm(pageHtmlStep1)
+		if formHtmlStep1 == "" {
+			return errors.New("Alexa.LogIn: could not find password form after submitting email")
+		}
+		formDataStep2 := c.cookieHelper.ExtractLoginFormInputs(formHtmlStep1)
+		formDataStep2.Set("password", c.password)
+        // The email is often included as a hidden field in the password form.
+		formDataStep2.Set("email", c.user)
+
+
+		_, err = submitPasswordForm(c.baseDomain, referer, formDataStep2, c.client)
 		if err != nil {
-			return errors.Wrap(err, "Alexa.LogIn submit step 2 login form failed")
+			return errors.Wrap(err, "Alexa.LogIn: failed to submit password form")
 		}
 
-		// get devices (sets csrf cookie) and save cookies
+		// Get devices to confirm successful login and acquire a CSRF token.
 		_, err = c.GetDevices()
 		if err != nil {
-			return errors.Wrap(err, "Alexa.LogIn getting devices failed")
+			return errors.Wrap(err, "Alexa.LogIn: getting devices failed after login")
 		}
+
 		if err := c.cookieHelper.SaveCookies(c.client.GetCookieJar(), c.baseDomain); err != nil {
-			return errors.Wrap(err, "Alexa.LogIn saving cookies failed")
+			return errors.Wrap(err, "Alexa.LogIn: saving cookies failed")
 		}
 	} else {
 		if err := c.cookieHelper.LoadCookies(c.client.GetCookieJar(), c.baseDomain); err != nil {
-			return errors.Wrap(err, "Alexa.LogIn loading cookies failed")
+			return errors.Wrap(err, "Alexa.LogIn: loading cookies failed")
 		}
 	}
-	csrf := c.cookieHelper.ExtractCSRF(c.client.GetCookieJar(), c.baseDomain)
-	if csrf == "" {
-		return errors.New("Alexa.LogIn empty csrf cookie")
+
+	c.csrf = c.cookieHelper.ExtractCSRF(c.client.GetCookieJar(), c.baseDomain)
+	if c.csrf == "" {
+		return errors.New("Alexa.LogIn: could not find CSRF token after login")
 	}
-	c.csrf = csrf // sets csrf param
 	return nil
 }
 
@@ -160,8 +167,8 @@ func getLoginForm(baseDomain string, client httpclient.IHttpClient) (pageHtml st
 		"&openid.claimed_id=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select" +
 		"&openid.oa2.client_id=" +
 		"&disableLoginPrepopulate=0" +
-		"&openid.ns=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0" // params order matters ;(
-	response, err := client.SimpleGET(formUrl, buildWebViewHeaders(referer))
+		"&openid.ns=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0"
+	response, err := client.SimpleGET(formUrl, buildWebViewHeaders(""))
 	if err != nil {
 		return "", "", errors.Wrap(err, "getting login form failed")
 	}
@@ -171,32 +178,31 @@ func getLoginForm(baseDomain string, client httpclient.IHttpClient) (pageHtml st
 	return response.Body, formUrl, nil
 }
 
-func submitLoginForm(baseDomain string, referer string, formData *url.Values, client httpclient.IHttpClient) (pageHtml string, err error) {
+func submitEmailForm(baseDomain string, referer string, formData *url.Values, client httpclient.IHttpClient) (pageHtml string, err error) {
 	formUrl := fmt.Sprintf("https://www.%s/ap/signin", baseDomain)
 	response, err := client.SimplePOST(formUrl, buildWebViewHeaders(referer), formData)
 	if err != nil {
 		return "", errors.Wrap(err, "submit failed")
 	}
+	// The response should be a 200 OK with the password page
 	if response.Status != 200 {
-		return response.Body, errors.Errorf("submit failed, wrong status: %d, successful login submit should be a OK 200", response.Status)
+		return response.Body, errors.Errorf("submit failed, wrong status: %d, expected 200 OK with password form", response.Status)
 	}
 	return response.Body, nil
 }
 
-func submitLoginFormFinal(baseDomain string, referer string, formData *url.Values, client httpclient.IHttpClient) (pageHtml string, err error) {
+func submitPasswordForm(baseDomain string, referer string, formData *url.Values, client httpclient.IHttpClient) (pageHtml string, err error) {
 	formUrl := fmt.Sprintf("https://www.%s/ap/signin", baseDomain)
 	response, err := client.SimplePOST(formUrl, buildWebViewHeaders(referer), formData)
 	if err != nil {
 		return "", errors.Wrap(err, "submit failed")
 	}
-	if response.Status != 302 || response.Redirect == "" {
-		return response.Body, errors.Errorf("submit failed, wrong status: %d, successful login submit should be a redirect", response.Status)
-	}
-	if !strings.Contains(response.Redirect, "maplanding") {
-		return "", errors.Errorf("submit failed, try logining in from an app on the same network: %s", response.Redirect)
+	if response.Status != 302 || !strings.Contains(response.Redirect, "maplanding") {
+		return response.Body, errors.Errorf("submit failed, wrong status: %d, successful login should redirect to 'maplanding'. Redirect was: '%s'", response.Status, response.Redirect)
 	}
 	return response.Body, nil
 }
+
 
 func buildAppHeaders(csrf string) (headers *httpclient.Headers) {
 	return &httpclient.Headers{
@@ -227,9 +233,9 @@ func buildWebViewHeaders(referer string) (headers *httpclient.Headers) {
 
 func (c *AlexaClient) retry(retryBlock func() error) error {
 	err := retryBlock()
-	for httpclient.IsAuthError(err) && c.retries < c.retriesMax { // while auth error and have retries
+	for httpclient.IsAuthError(err) && c.retries < c.retriesMax {
 		c.retries++
-		if err = c.LogIn(true); err == nil { // re-login and call again
+		if err = c.LogIn(true); err == nil {
 			err = retryBlock()
 		}
 	}
